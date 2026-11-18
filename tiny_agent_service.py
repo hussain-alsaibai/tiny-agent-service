@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["AgentService", "serve"]
 
 logging.basicConfig(
@@ -696,16 +696,32 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def _read_body(self) -> bytes:
-        cl = int(self.headers.get("Content-Length", 0))
+        # `int("abc")` raised outside any try, so a malformed header killed the
+        # response entirely: the caller saw a timeout, not a 400. A header the
+        # client controls must not be able to suppress the reply.
+        raw = self.headers.get("Content-Length")
+        try:
+            cl = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            return None  # caller answers 400
+        if cl < 0:
+            return None
         return self.rfile.read(cl) if cl else b"{}"
 
     def _json_resp(self, status: int, data: dict) -> None:
         body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Request-ID", str(uuid.uuid4())[:12])
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            # Every response went out unframed. HTTP/1.0 closes on finish so a
+            # direct client framed the body by EOF; a proxy or load balancer
+            # that keeps the connection alive must guess where the body ends.
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Request-ID", str(uuid.uuid4())[:12])
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def do_GET(self) -> None:
         if not self._svc:
@@ -733,8 +749,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._svc:
             self._json_resp(500, {"error": "no service"})
             return
+        raw_body = self._read_body()
+        if raw_body is None:
+            # A bad Content-Length is not malformed JSON; saying so would send
+            # the caller looking at their payload instead of their transport.
+            self._json_resp(400, {"error": "invalid Content-Length header"})
+            return
         try:
-            body = json.loads(self._read_body())
+            body = json.loads(raw_body)
         except Exception:
             self._json_resp(400, {"error": "invalid JSON"})
             return

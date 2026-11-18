@@ -160,5 +160,96 @@ class TestToolImpls:
         assert "hello" in result["stdout"]
 
 
+class TestResponseFraming:
+    """Wire-level tests: read the bytes the server sends, not the dict it built.
+
+    The suite above exercises the service object directly, so nothing ever
+    looked at a response header. Every reply shipped without a Content-Length,
+    and a malformed one produced no reply at all.
+    """
+
+    @staticmethod
+    def _handler_base():
+        import tiny_agent_service
+
+        return tiny_agent_service
+
+    @pytest.fixture()
+    def server(self):
+        import threading
+        from http.server import HTTPServer
+        import tiny_agent_service
+
+        svc = tiny_agent_service.AgentService()
+        base = tiny_agent_service._Handler
+
+        class Handler(base):
+            def __init__(self, *args, **kwargs):
+                super().__init__(svc, *args, **kwargs)
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield httpd.server_address[1]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    @staticmethod
+    def _raw(port, method, path, body=b"", headers=""):
+        import socket
+
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            sock.sendall(
+                f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+                f"{headers}Connection: close\r\n\r\n".encode() + body
+            )
+            data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            sock.close()
+        head, _, payload = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        hdrs = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                hdrs[k.strip().lower()] = v.strip()
+        return lines[0], hdrs, payload
+
+    def test_health_declares_its_length(self, server):
+        status, headers, body = self._raw(server, "GET", "/health")
+        assert "200" in status
+        assert headers.get("content-length") == str(len(body))
+        assert body
+
+    def test_404_declares_its_length(self, server):
+        status, headers, body = self._raw(server, "GET", "/nope")
+        assert "404" in status
+        assert headers.get("content-length") == str(len(body))
+
+    def test_malformed_content_length_gets_a_framed_400(self, server):
+        status, headers, body = self._raw(
+            server, "POST", "/tasks", b"{}", "Content-Length: abc\r\n"
+        )
+        assert "400" in status
+        assert headers.get("content-length") == str(len(body))
+        assert b"Content-Length" in body
+
+    def test_bad_header_is_not_reported_as_bad_json(self, server):
+        """Saying 'invalid JSON' sends the caller to the wrong layer."""
+        _, _, body = self._raw(
+            server, "POST", "/tasks", b"{}", "Content-Length: abc\r\n"
+        )
+        assert b"invalid JSON" not in body
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
